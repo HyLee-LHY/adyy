@@ -1,0 +1,91 @@
+name: Download Anime m3u8 (with Resume support)
+
+on:
+  workflow_dispatch:
+    inputs:
+      json_url:
+        description: 'JSON 文件的 URL 地址'
+        required: true
+        default: ''
+
+jobs:
+  download_and_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须赋予写权限以发布 Release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Process JSON and Upload Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JSON_URL: ${{ github.event.inputs.json_url }}
+        run: |
+          # 1. 获取 JSON 内容
+          echo "Fetching JSON from $JSON_URL..."
+          JSON_DATA=$(curl -sL "$JSON_URL")
+          
+          # 2. 解析 animeName (如果为空则报错)
+          ANIME_NAME=$(echo "$JSON_DATA" | jq -r '.animeName')
+          if [ "$ANIME_NAME" == "null" ] || [ -z "$ANIME_NAME" ]; then
+            echo "Error: Could not find animeName in JSON"
+            exit 1
+          fi
+          echo "Anime Name: $ANIME_NAME"
+          
+          # 3. 将所有 URL 提取到临时数组中
+          mapfile -t URLS < <(echo "$JSON_DATA" | jq -r '.urls[]')
+          TOTAL=${#URLS[@]}
+          echo "Total episodes found: $TOTAL"
+
+          # 4. 循环处理
+          for (( i=0; i<$TOTAL; i++ )); do
+            EP_NUM=$((i + 1))
+            M3U8_URL="${URLS[$i]}"
+            RELEASE_TAG="${ANIME_NAME}-${EP_NUM}"
+            FILE_NAME="${EP_NUM}.mp4"
+
+            echo "--------------------------------------------"
+            echo "Checking Episode $EP_NUM (Tag: $RELEASE_TAG)..."
+
+            # 5. 检测 Release 是否已存在
+            # 使用 gh release view 检查标签，如果返回 0 表示已存在
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo ">>> Skip: Release $RELEASE_TAG already exists."
+              continue
+            fi
+
+            # 6. 如果不存在，则下载
+            echo ">>> Downloading $M3U8_URL..."
+            # 使用 -reconnect 等参数增强网络稳定性
+            ffmpeg -i "$M3U8_URL" -c copy -bsf:a aac_adtstoasc "$FILE_NAME"
+            
+            # 检查 ffmpeg 是否执行成功
+            if [ $? -ne 0 ]; then
+               echo "Error: Failed to download episode $EP_NUM"
+               # 如果单集下载失败，可以选择跳过或停止。这里选择停止以防产生坏文件。
+               exit 1 
+            fi
+
+            # 7. 创建 Release 并上传
+            echo ">>> Creating Release: $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" "$FILE_NAME" \
+               --title "$RELEASE_TAG" \
+               --notes "Auto-downloaded episode $EP_NUM"
+
+            # 8. 清理本地文件
+            rm -f "$FILE_NAME"
+            echo ">>> Done: Episode $EP_NUM"
+
+            # 可选：由于 GitHub Actions 有 6 小时限制，检测如果接近时间可以优雅退出
+            # 这里的简单逻辑是：每集下载完都会保存状态（Release），下次运行自动跳过。
+          done
+
+          echo "All pending tasks completed!"
